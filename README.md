@@ -36,7 +36,7 @@ exports/
 ### 3. Install and configure
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/discord-archiver.git
+git clone https://github.com/esaruoho/discord-archiver.git
 cd discord-archiver
 
 python -m venv venv
@@ -78,6 +78,40 @@ All CLI flags:
 | `--no-attachments` | off | Skip downloading attachments (URLs still recorded) |
 | `--resume` | off | Only fetch messages newer than the last archived one. Reads existing `messages.json`, finds the highest message ID, asks Discord for everything after it. |
 | `--max-retries` | `5` | Attachment download retries on HTTP 429 (rate-limited), 5xx, or network errors. 429s honor the `Retry-After` header; 5xx/network use exponential backoff (1s, 2s, 4s, 8s, 16s). |
+
+### Recurring / incremental archive
+
+First run does the full history. Every subsequent run with `--resume` only fetches messages newer than the last archived one and appends them to the existing JSON + markdown:
+
+```bash
+# First run — full archive
+python python/archive.py --output-dir ./exports/my-channel
+
+# Hours / days / weeks later — incremental
+python python/archive.py --output-dir ./exports/my-channel --resume
+```
+
+Cron example (daily at 03:00):
+
+```cron
+0 3 * * *  cd ~/discord-archiver && venv/bin/python python/archive.py --output-dir ./exports/my-channel --resume >> ~/archive.log 2>&1
+```
+
+Notes:
+- `messages.json` is the source of truth. `changelog.md` is regenerated from it on every run; any hand-edits will be overwritten.
+- `--resume` with no existing `messages.json` falls back to a full archive (with a warning).
+- Skipped messages (via `--skip-pattern`) aren't stored, so they won't be re-fetched on resume either — but their IDs are still seen by Discord, so the snowflake-based cursor advances past them correctly.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `Privileged intent provided is not enabled` on startup | Message Content Intent not enabled in the developer portal | Application → Bot → Privileged Gateway Intents → toggle on |
+| `Channel <id> not found.` | Bot isn't in the server, or doesn't have View Channel on this channel | Re-invite with the OAuth2 URL, or grant `View Channel` + `Read Message History` in channel settings |
+| `Missing bot token` / `Missing channel ID` | `.env` not loaded or not in the working directory | Run from the repo root, or pass `--token` / `--channel` explicitly |
+| Many `download_failed` entries with HTTP 403 | Discord CDN attachment URLs expired (they contain time-limited auth tokens) | Re-run from scratch — the bot fetches fresh URLs from the API on each run |
+| Hangs or stalls mid-archive on a huge channel | Hitting Discord API rate limits — discord.py is sleeping until the bucket refills | Wait it out; the library handles 429s transparently. CDN downloads have their own retry via `--max-retries`. |
+| `Resume requested but no existing messages.json found` | `--output-dir` doesn't contain a previous export | Run without `--resume` first, or point `--output-dir` at the existing export folder |
 
 ## Browser mode (JavaScript)
 
