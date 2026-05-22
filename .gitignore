@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.local
+*.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Exports — actual archived data should not be committed
+exports/
+attachments/
+
+# macOS
+.DS_Store
