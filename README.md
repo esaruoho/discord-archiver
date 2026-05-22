@@ -76,6 +76,8 @@ All CLI flags:
 | `--title` | `Channel Archive` | Header at the top of `changelog.md` |
 | `--skip-pattern REGEX` | _(none)_ | Drop messages matching this regex. Repeatable. |
 | `--no-attachments` | off | Skip downloading attachments (URLs still recorded) |
+| `--resume` | off | Only fetch messages newer than the last archived one. Reads existing `messages.json`, finds the highest message ID, asks Discord for everything after it. |
+| `--max-retries` | `5` | Attachment download retries on HTTP 429 (rate-limited), 5xx, or network errors. 429s honor the `Retry-After` header; 5xx/network use exponential backoff (1s, 2s, 4s, 8s, 16s). |
 
 ## Browser mode (JavaScript)
 
@@ -138,9 +140,7 @@ Things the current archiver silently ignores or doesn't handle. None of these ar
 - [ ] **Replies / message references** — `message.reference` (which message this is a reply to) is dropped. Useful for reconstructing conversation threads.
 - [ ] **Pinned messages flag** — `message.pinned` boolean isn't recorded.
 - [ ] **Edit history** — only the current version of a message is captured. Discord doesn't expose prior versions via API anyway, but `message.edited_at` could be recorded.
-- [ ] **Resume / incremental archive** — re-running re-downloads everything. A `--since <timestamp>` or `--after-message-id` flag would let you append to an existing archive.
-- [ ] **Rate-limit handling for attachment downloads** — discord.py handles 429s for API calls, but the aiohttp attachment downloader doesn't. Large channels could trip Discord CDN limits.
-- [ ] **Tests** — no test suite. `sanitize_filename` and `render_embed_md` are pure functions that would be trivial to cover.
+- [ ] **Tests** — no test suite. `sanitize_filename` and `rebuild_markdown_block` are pure functions that would be trivial to cover.
 - [ ] **CI** — no GitHub Actions for lint / typecheck / smoke run.
 - [ ] **Browser mode: thread + forum support** — currently scrapes only the main channel scroll.
 - [ ] **Schema unification between modes** — bot mode produces `attachments[]` with local paths and metadata; browser mode produces separate `images[] / videos[] / files[]` URL arrays. Downstream consumers have to branch on mode.

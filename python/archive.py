@@ -10,6 +10,7 @@ overridable via CLI flags. No credentials live in this file.
 """
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -60,6 +61,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip downloading attachments (URLs are still recorded in JSON).",
     )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing <output-dir>/messages.json: only fetch "
+             "messages newer than the last archived one. Rebuilds changelog.md "
+             "from the combined message list.",
+    )
+    p.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Max retries per attachment download on 429/5xx/network errors (default: 5).",
+    )
     return p.parse_args()
 
 
@@ -67,20 +81,21 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"[ :/\\]+", "_", name)
 
 
-def render_embed_md(embed: discord.Embed) -> str:
+def render_embed_md_from_dict(embed: dict) -> str:
     parts: list[str] = []
-    if embed.author and embed.author.name:
-        parts.append(f"**{embed.author.name}**")
-    if embed.title:
-        parts.append(f"[{embed.title}]({embed.url})" if embed.url else f"**{embed.title}**")
-    elif embed.url:
-        parts.append(f"[Embedded Link]({embed.url})")
-    if embed.description:
-        parts.append(embed.description)
-    for field in embed.fields:
-        parts.append(f"**{field.name}:** {field.value}")
-    if embed.footer and embed.footer.text:
-        parts.append(f"_{embed.footer.text}_")
+    if embed.get("author"):
+        parts.append(f"**{embed['author']}**")
+    if embed.get("title"):
+        url = embed.get("url")
+        parts.append(f"[{embed['title']}]({url})" if url else f"**{embed['title']}**")
+    elif embed.get("url"):
+        parts.append(f"[Embedded Link]({embed['url']})")
+    if embed.get("description"):
+        parts.append(embed["description"])
+    for field in embed.get("fields", []):
+        parts.append(f"**{field['name']}:** {field['value']}")
+    if embed.get("footer"):
+        parts.append(f"_{embed['footer']}_")
     return "\n".join(parts)
 
 
@@ -95,6 +110,53 @@ def embed_to_dict(embed: discord.Embed) -> dict:
     }
 
 
+def rebuild_markdown_block(record: dict) -> str:
+    """Reconstruct a markdown block from a stored JSON message record."""
+    date = record["timestamp"][:10] if record.get("timestamp") else "(no date)"
+    block: list[str] = [f"### {date} - {record['author']}", "", record.get("content") or "_(no text)_"]
+    for att in record.get("attachments", []):
+        block.append(f"![]({att['local_path']})")
+    for emb in record.get("embeds", []):
+        rendered = render_embed_md_from_dict(emb)
+        if rendered:
+            block.append(rendered)
+    return "\n\n".join(part for part in block if part)
+
+
+async def download_attachment(
+    session: aiohttp.ClientSession,
+    url: str,
+    dest_path: Path,
+    max_retries: int,
+) -> tuple[bool, str | None]:
+    """Download with retry on 429 (honoring Retry-After) and exponential backoff on 5xx/network errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    dest_path.write_bytes(await resp.read())
+                    return True, None
+                if resp.status == 429:
+                    retry_after = float(resp.headers.get("Retry-After", "1"))
+                    print(f"  rate-limited (429), sleeping {retry_after}s...")
+                    await asyncio.sleep(retry_after)
+                    continue
+                if 500 <= resp.status < 600 and attempt < max_retries:
+                    backoff = 2 ** attempt
+                    print(f"  server error {resp.status}, retry in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                    continue
+                return False, f"HTTP {resp.status}"
+        except aiohttp.ClientError as exc:
+            if attempt < max_retries:
+                backoff = 2 ** attempt
+                print(f"  network error: {exc}, retry in {backoff}s...")
+                await asyncio.sleep(backoff)
+                continue
+            return False, f"network: {exc}"
+    return False, "max retries exceeded"
+
+
 class Archiver(discord.Client):
     def __init__(self, *, args: argparse.Namespace, intents: discord.Intents):
         super().__init__(intents=intents)
@@ -102,12 +164,72 @@ class Archiver(discord.Client):
         self.skip_patterns = [re.compile(p, re.IGNORECASE) for p in args.skip_pattern]
         self.output_dir = Path(args.output_dir).expanduser().resolve()
         self.attachments_dir = self.output_dir / "attachments"
+        self.messages_json_path = self.output_dir / "messages.json"
 
     async def on_ready(self) -> None:
         try:
             await self._run()
         finally:
             await self.close()
+
+    def _load_existing(self) -> tuple[list[dict], int | None]:
+        """Return (existing_records, last_message_id_int) for resume mode."""
+        if not self.messages_json_path.exists():
+            return [], None
+        try:
+            data = json.loads(self.messages_json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"Could not parse existing messages.json: {exc}", file=sys.stderr)
+            return [], None
+        records = data.get("messages", [])
+        ids = [int(r["id"]) for r in records if r.get("id")]
+        return records, max(ids) if ids else None
+
+    async def _process_message(
+        self,
+        message: discord.Message,
+        session: aiohttp.ClientSession,
+    ) -> dict | None:
+        content = (message.content or "").strip()
+        if any(p.match(content) for p in self.skip_patterns):
+            print(f"  skip: {content[:80]}")
+            return None
+
+        date = message.created_at.strftime("%Y-%m-%d")
+        author = message.author.name
+
+        attachment_records: list[dict] = []
+        for att in message.attachments:
+            safe = sanitize_filename(f"{date}_{att.filename}")
+            local_path = self.attachments_dir / safe
+            record = {
+                "filename": att.filename,
+                "url": att.url,
+                "local_path": str(local_path.relative_to(self.output_dir)),
+                "content_type": att.content_type,
+                "size": att.size,
+            }
+            if not self.args.no_attachments:
+                ok, err = await download_attachment(
+                    session, att.url, local_path, self.args.max_retries
+                )
+                if ok:
+                    print(f"  saved: {safe}")
+                else:
+                    print(f"  failed: {att.url}: {err}", file=sys.stderr)
+                    record["download_failed"] = True
+                    record["download_error"] = err
+            attachment_records.append(record)
+
+        return {
+            "id": str(message.id),
+            "timestamp": message.created_at.isoformat(),
+            "author": author,
+            "author_id": str(message.author.id),
+            "content": content,
+            "attachments": attachment_records,
+            "embeds": [embed_to_dict(e) for e in message.embeds],
+        }
 
     async def _run(self) -> None:
         print(f"Logged in as {self.user}")
@@ -120,72 +242,36 @@ class Archiver(discord.Client):
         if not self.args.no_attachments:
             self.attachments_dir.mkdir(parents=True, exist_ok=True)
 
-        messages_json: list[dict] = []
-        markdown_blocks: list[str] = []
+        existing_records: list[dict] = []
+        after_obj: discord.Object | None = None
+        if self.args.resume:
+            existing_records, last_id = self._load_existing()
+            if last_id is not None:
+                after_obj = discord.Object(id=last_id)
+                print(f"Resuming after message ID {last_id} ({len(existing_records)} existing records)")
+            else:
+                print("Resume requested but no existing messages.json found — doing full archive.")
+
+        new_records: list[dict] = []
+        history_kwargs = {"limit": None, "oldest_first": True}
+        if after_obj is not None:
+            history_kwargs["after"] = after_obj
 
         async with aiohttp.ClientSession() as session:
-            async for message in channel.history(limit=None, oldest_first=True):
-                content = (message.content or "").strip()
-                if any(p.match(content) for p in self.skip_patterns):
-                    print(f"  skip: {content[:80]}")
-                    continue
+            async for message in channel.history(**history_kwargs):
+                record = await self._process_message(message, session)
+                if record is not None:
+                    new_records.append(record)
 
-                date = message.created_at.strftime("%Y-%m-%d")
-                author = message.author.name
+        all_records = existing_records + new_records
 
-                attachment_records: list[dict] = []
-                attachment_md: list[str] = []
-                for att in message.attachments:
-                    safe = sanitize_filename(f"{date}_{att.filename}")
-                    local_path = self.attachments_dir / safe
-                    record = {
-                        "filename": att.filename,
-                        "url": att.url,
-                        "local_path": str(local_path.relative_to(self.output_dir)),
-                        "content_type": att.content_type,
-                        "size": att.size,
-                    }
-                    if not self.args.no_attachments:
-                        try:
-                            async with session.get(att.url) as resp:
-                                if resp.status == 200:
-                                    local_path.write_bytes(await resp.read())
-                                    print(f"  saved: {safe}")
-                                else:
-                                    print(f"  failed ({resp.status}): {att.url}", file=sys.stderr)
-                                    record["download_failed"] = True
-                        except Exception as exc:
-                            print(f"  error: {att.url}: {exc}", file=sys.stderr)
-                            record["download_failed"] = True
-                    attachment_records.append(record)
-                    attachment_md.append(f"![]({record['local_path']})")
-
-                embed_records = [embed_to_dict(e) for e in message.embeds]
-                embed_md = [render_embed_md(e) for e in message.embeds]
-                embed_md = [e for e in embed_md if e]
-
-                messages_json.append({
-                    "id": str(message.id),
-                    "timestamp": message.created_at.isoformat(),
-                    "author": author,
-                    "author_id": str(message.author.id),
-                    "content": content,
-                    "attachments": attachment_records,
-                    "embeds": embed_records,
-                })
-
-                block = [f"### {date} - {author}", "", content or "_(no text)_"]
-                block.extend(attachment_md)
-                block.extend(embed_md)
-                markdown_blocks.append("\n\n".join(part for part in block if part))
-
-        (self.output_dir / "messages.json").write_text(
+        self.messages_json_path.write_text(
             json.dumps(
                 {
                     "exported_at": datetime.now(timezone.utc).isoformat(),
                     "channel_id": str(self.args.channel),
-                    "total_messages": len(messages_json),
-                    "messages": messages_json,
+                    "total_messages": len(all_records),
+                    "messages": all_records,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -193,12 +279,17 @@ class Archiver(discord.Client):
             encoding="utf-8",
         )
 
+        markdown_blocks = [rebuild_markdown_block(r) for r in all_records]
         (self.output_dir / "changelog.md").write_text(
             f"# {self.args.title}\n\n" + "\n\n---\n\n".join(markdown_blocks) + "\n",
             encoding="utf-8",
         )
 
-        print(f"\nDone. {len(messages_json)} messages → {self.output_dir}")
+        print(
+            f"\nDone. {len(all_records)} messages total "
+            f"({len(new_records)} new, {len(existing_records)} carried over) "
+            f"→ {self.output_dir}"
+        )
 
 
 def main() -> int:

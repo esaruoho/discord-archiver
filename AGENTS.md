@@ -33,8 +33,9 @@ browser/
 |---|---|
 | Add a CLI flag to bot mode | `python/archive.py` → `parse_args()` |
 | Change bot-mode output format | `python/archive.py` → `_run()` (last 30 lines) |
-| Add a new field to bot-mode JSON | `python/archive.py` → the `messages_json.append({...})` block |
-| Change bot-mode markdown rendering | `python/archive.py` → `render_embed_md()` and the `block = [...]` assembly |
+| Add a new field to bot-mode JSON | `python/archive.py` → `_process_message()` return dict |
+| Change bot-mode markdown rendering | `python/archive.py` → `rebuild_markdown_block()` and `render_embed_md_from_dict()` |
+| Tune attachment retry / backoff | `python/archive.py` → `download_attachment()` |
 | Add a new DOM selector for browser mode | `browser/scraper.js` → `extractVisible()` |
 | Change browser-mode embed structure | `browser/scraper.js` → `extractEmbeds()` |
 | Update the noise filter | both: `SKIP_PATTERNS` at top of each script |
